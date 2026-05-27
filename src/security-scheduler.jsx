@@ -1808,9 +1808,8 @@ function GuardModal({ data, mobile, onSave, onDelete, onClose }) {
             <div style={{ marginBottom: 12 }}>
               <label style={{ fontSize: 11, fontWeight: 600, color: "#374151", marginBottom: 4, display: "block" }}>Full name *</label>
               <input style={{ ...inpS, background: !isNew ? "#f8fafc" : "#fff", color: !isNew ? "#64748b" : "#1e293b" }}
-                value={f.name} onChange={e => isNew && set("name", e.target.value)}
-                placeholder="e.g. Kirtesh Singh" readOnly={!isNew} />
-              {!isNew && <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>Delete and re-add to rename.</div>}
+                value={f.name} onChange={e => set("name", e.target.value)}
+                placeholder="e.g. Kirtesh Singh" />
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
               <div>
