@@ -451,7 +451,7 @@ export default function App() {
             onEdit={g => setModal({ type: "guard_modal", data: { ...g } })}
             onAdd={() => setModal({ type: "guard_modal", data: { name: "", phone: "", email: "", site: "", role: "Security Guard", employmentType: "Full-time", notes: "", schedule: {} } })}
           />}
-          {page === "staff" && <StaffPage staffMap={staffMap} doubles={doubles} mobile={mobile} />}
+          {page === "staff" && <StaffPage staffMap={staffMap} doubles={doubles} mobile={mobile} weekDates={weekDates} guards={guards} />}
           {page === "sites" && <SitesPage patients={patients} assigns={assigns} weekDates={weekDates} getAssign={getAssign} />}
           {page === "alerts" && <AlertsPage gaps={gaps} doubles={doubles} patients={patients} onFix={navTo} onAssign={(pid, sh, date) => setModal({ type: "assign", patientId: pid, shift: sh, date, current: getAssign(pid, sh, date)?.staff || "" })} />}
           {page === "payroll" && <PayrollPage guards={guards} assigns={assigns} setGuards={setGuards} mobile={mobile}
@@ -862,26 +862,227 @@ function PatientsPage({ patients, assigns, weekDates, getAssign, mobile, onEdit,
 // ─────────────────────────────────────────────────────────────────────────────
 // Staff Hours Page
 // ─────────────────────────────────────────────────────────────────────────────
-function StaffPage({ staffMap, doubles, mobile }) {
-  const maxH = Math.max(...staffMap.map(s => s.hours), 1);
+function StaffPage({ staffMap, doubles, mobile, weekDates, guards }) {
   const over40 = staffMap.filter(s => s.hours > 40).length;
+  const [selected, setSelected] = useState(null);
+  const [emailStatus, setEmailStatus] = useState("idle"); // idle | sending | sent | error
+  const selectedStaff = selected ? staffMap.find(s => s.name === selected) : null;
+  const selectedGuard = selected ? guards.find(g => g.name.toLowerCase().trim() === selected.toLowerCase().trim()) : null;
+
+  const sendEmail = async () => {
+    if (!selectedGuard?.email) {
+      alert(`No email on file for ${selected}.
+Please add one in their Guard profile first.`);
+      return;
+    }
+    setEmailStatus("sending");
+    try {
+      // Build schedule HTML table
+      const rows = weekDates.map(d => {
+        const dk = toDateKey(d);
+        const dayName = d.toLocaleDateString("en-CA", { weekday: "long", month: "short", day: "numeric" });
+        const dayAssigns = selectedStaff.assignments.filter(a => a.date === dk);
+        if (!dayAssigns.length) return `
+          <tr>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;font-size:13px;color:#374151;font-weight:500">${dayName}</td>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;text-align:center;color:#94a3b8" colspan="3">— Day off</td>
+          </tr>`;
+        return dayAssigns.map(a => {
+          const sh = SHIFTS[a.shift];
+          return `
+          <tr>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;font-size:13px;color:#374151;font-weight:500">${dayName}</td>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;background:${sh?.bg};color:${sh?.color};font-weight:700;text-align:center;font-size:13px">${sh?.label || a.shift}</td>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;font-size:13px;color:#374151;text-align:center">${sh?.time || ""}</td>
+            <td style="padding:10px 14px;border:1px solid #e2e8f0;font-size:13px;color:#374151">${a.patient} · ${a.hours}h</td>
+          </tr>`;
+        }).join("");
+      }).join("");
+
+      const tableHtml = `
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="background:#1e293b">
+              <th style="padding:10px 14px;color:#f1f5f9;font-size:12px;text-align:left;border:1px solid #334155">Day</th>
+              <th style="padding:10px 14px;color:#f1f5f9;font-size:12px;text-align:center;border:1px solid #334155">Shift</th>
+              <th style="padding:10px 14px;color:#f1f5f9;font-size:12px;text-align:center;border:1px solid #334155">Time</th>
+              <th style="padding:10px 14px;color:#f1f5f9;font-size:12px;text-align:left;border:1px solid #334155">Patient · Hours</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+
+      const wLabel = `${fmtDate(weekDates[0])} – ${fmtDate(weekDates[6])}`;
+      const BASE = "https://secureshift-lcro.onrender.com/api";
+      const res = await fetch(`${BASE}/send-schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: selectedGuard.email,
+          guardName: selectedStaff.name,
+          weekLabel: wLabel,
+          html: tableHtml,
+        }),
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || "Failed");
+      setEmailStatus("sent");
+      setTimeout(() => setEmailStatus("idle"), 3000);
+    } catch (err) {
+      alert("Failed to send: " + err.message);
+      setEmailStatus("error");
+      setTimeout(() => setEmailStatus("idle"), 2000);
+    }
+  };
+
   return (
-    <div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8, marginBottom: 12 }}>
-        {[{ l: "Total staff", v: staffMap.length, bg: "#f8fafc", c: "#0f172a" }, { l: "≤ 40h ✓", v: staffMap.filter(s => s.hours <= 40).length, bg: "#f0fdf4", c: "#16a34a" }, { l: "Over 40h ⚠", v: over40, bg: over40 > 0 ? "#fef2f2" : "#f0fdf4", c: over40 > 0 ? "#dc2626" : "#16a34a" }, { l: "Double shift ⛔", v: doubles.length, bg: doubles.length > 0 ? "#fef2f2" : "#f0fdf4", c: doubles.length > 0 ? "#dc2626" : "#16a34a" }].map(x => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+      {/* Stats */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
+        {[{ l: "Total staff", v: staffMap.length, bg: "#f8fafc", c: "#0f172a" },
+        { l: "≤ 40h ✓", v: staffMap.filter(s => s.hours <= 40).length, bg: "#f0fdf4", c: "#16a34a" },
+        { l: "Over 40h ⚠", v: over40, bg: over40 > 0 ? "#fef2f2" : "#f0fdf4", c: over40 > 0 ? "#dc2626" : "#16a34a" },
+        { l: "Double shift ⛔", v: doubles.length, bg: doubles.length > 0 ? "#fef2f2" : "#f0fdf4", c: doubles.length > 0 ? "#dc2626" : "#16a34a" },
+        ].map(x => (
           <div key={x.l} style={{ background: x.bg, borderRadius: 10, padding: "10px 12px" }}>
             <div style={{ fontSize: 10, color: x.c, marginBottom: 2, opacity: .8 }}>{x.l}</div>
             <div style={{ fontSize: 20, fontWeight: 700, color: x.c }}>{x.v}</div>
           </div>
         ))}
       </div>
-      {doubles.length > 0 && <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, padding: "10px 12px", marginBottom: 10, fontSize: 12, color: "#991b1b" }}>⛔ {doubles.length} guard{doubles.length > 1 ? "s" : ""} assigned to multiple shifts on the same day.</div>}
-      {over40 > 0 && <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 10, padding: "10px 12px", marginBottom: 10, fontSize: 12, color: "#92400e" }}>⚠ {over40} guard{over40 > 1 ? "s" : ""} exceed 40h this week.</div>}
+
+      {doubles.length > 0 && <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 10, padding: "10px 12px", fontSize: 12, color: "#991b1b" }}>⛔ {doubles.length} guard{doubles.length > 1 ? "s" : ""} assigned to multiple shifts on the same day.</div>}
+      {over40 > 0 && <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 10, padding: "10px 12px", fontSize: 12, color: "#92400e" }}>⚠ {over40} guard{over40 > 1 ? "s" : ""} exceed 40h this week.</div>}
+
+      {/* Individual schedule modal */}
+      {selectedStaff && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,.55)", display: "flex", alignItems: mobile ? "flex-end" : "center", justifyContent: "center", zIndex: 50 }}
+          onClick={() => setSelected(null)}>
+          <div style={{ background: "#fff", borderRadius: mobile ? "14px 14px 0 0" : "14px", width: "100%", maxWidth: mobile ? "100%" : "540px", maxHeight: "90vh", overflowY: "auto", display: "flex", flexDirection: "column" }}
+            onClick={e => e.stopPropagation()}>
+
+            {/* Header */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 18px", borderBottom: "1px solid #e2e8f0", flexShrink: 0, background: "#0f172a", borderRadius: mobile ? "14px 14px 0 0" : "14px 14px 0 0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {(() => { const [bg, col] = avCol(staffMap.indexOf(selectedStaff)); return <div style={{ width: 36, height: 36, borderRadius: "50%", background: bg, color: col, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 700 }}>{ini(selectedStaff.name)}</div>; })()}
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "#f1f5f9" }}>{selectedStaff.name}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8" }}>
+                    {selectedStaff.site} · {selectedStaff.hours}h this week
+                    {selectedGuard?.email && <span style={{ marginLeft: 6, color: "#64748b" }}>· {selectedGuard.email}</span>}
+                    {!selectedGuard?.email && <span style={{ marginLeft: 6, color: "#ef4444" }}>· No email on file</span>}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button
+                  onClick={sendEmail}
+                  disabled={emailStatus === "sending"}
+                  style={{
+                    ...btnS(false), fontSize: 11, padding: "5px 12px",
+                    background: emailStatus === "sent" ? "#f0fdf4" : emailStatus === "error" ? "#fef2f2" : "#fff",
+                    color: emailStatus === "sent" ? "#16a34a" : emailStatus === "error" ? "#dc2626" : "#374151",
+                    border: emailStatus === "sent" ? "1px solid #86efac" : emailStatus === "error" ? "1px solid #fecaca" : "1px solid #e2e8f0",
+                    opacity: emailStatus === "sending" ? 0.7 : 1,
+                  }}>
+                  {emailStatus === "sending" ? "⏳ Sending…" : emailStatus === "sent" ? "✓ Sent!" : emailStatus === "error" ? "✗ Failed" : "📧 Send schedule"}
+                </button>
+                <button onClick={() => { setSelected(null); setEmailStatus("idle"); }} style={{ background: "none", border: "none", color: "#94a3b8", fontSize: 22, cursor: "pointer", lineHeight: 1 }}>×</button>
+              </div>
+            </div>
+
+            {/* Hours bar */}
+            <div style={{ padding: "12px 18px", borderBottom: "1px solid #f1f5f9" }}>
+              {(() => {
+                const over = selectedStaff.hours > 40;
+                const pct = Math.min(100, Math.round(selectedStaff.hours / 40 * 100));
+                return (
+                  <div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6, fontSize: 11 }}>
+                      <span style={{ color: "#64748b" }}>Weekly hours</span>
+                      <span style={{ fontWeight: 700, color: over ? "#dc2626" : selectedStaff.hours === 40 ? "#16a34a" : "#d97706" }}>{selectedStaff.hours}/40h</span>
+                    </div>
+                    <div style={{ height: 7, background: "#f1f5f9", borderRadius: 4, overflow: "hidden" }}>
+                      <div style={{ height: "100%", width: `${pct}%`, background: over ? "#ef4444" : pct >= 80 ? "#22c55e" : "#f59e0b", borderRadius: 4 }}></div>
+                    </div>
+                    {over && <div style={{ fontSize: 10, color: "#dc2626", marginTop: 4 }}>⚠ Exceeds 40h limit by {selectedStaff.hours - 40}h</div>}
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Day-by-day schedule */}
+            <div style={{ padding: "14px 18px", flex: 1 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 10 }}>Week schedule</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {weekDates.map((d, i) => {
+                  const dk = toDateKey(d);
+                  const dayName = d.toLocaleDateString("en-CA", { weekday: "long", month: "short", day: "numeric" });
+                  const todayMark = isToday(d);
+                  const dayAssigns = selectedStaff.assignments.filter(a => a.date === dk);
+                  const sh = dayAssigns[0] ? SHIFTS[dayAssigns[0].shift] : null;
+                  return (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 9, background: todayMark ? "#eff6ff" : "#f8fafc", border: `1px solid ${todayMark ? "#bfdbfe" : "#e2e8f0"}` }}>
+                      {/* Day */}
+                      <div style={{ minWidth: mobile ? 90 : 130, flexShrink: 0 }}>
+                        <div style={{ fontSize: 12, fontWeight: todayMark ? 700 : 500, color: todayMark ? "#1e40af" : "#374151" }}>{dayName}</div>
+                        {todayMark && <div style={{ fontSize: 9, color: "#3b82f6", fontWeight: 600 }}>TODAY</div>}
+                      </div>
+                      {/* Shift + patient */}
+                      {dayAssigns.length > 0 ? (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 1 }}>
+                          {dayAssigns.map((a, ai) => {
+                            const s = SHIFTS[a.shift];
+                            return (
+                              <div key={ai} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                <span style={{ ...pill(s?.bg, s?.color), fontSize: 10 }}>{s?.label} · {s?.time}</span>
+                                <span style={{ fontSize: 11, color: "#374151" }}>→ {a.patient}</span>
+                                <span style={{ fontSize: 10, color: "#94a3b8" }}>{a.hours}h</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <span style={{ fontSize: 11, color: "#94a3b8" }}>— Day off</span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Shift summary */}
+            <div style={{ padding: "12px 18px", borderTop: "1px solid #e2e8f0", background: "#f8fafc" }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", marginBottom: 8 }}>Shift breakdown</div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {Object.entries(
+                  selectedStaff.assignments.reduce((acc, a) => {
+                    acc[a.shift] = (acc[a.shift] || 0) + a.hours;
+                    return acc;
+                  }, {})
+                ).map(([sk, hrs]) => (
+                  <div key={sk} style={{ padding: "5px 10px", borderRadius: 8, background: SHIFTS[sk]?.bg, color: SHIFTS[sk]?.color, fontSize: 11, fontWeight: 600 }}>
+                    {SHIFTS[sk]?.label} · {hrs}h
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Staff cards */}
       <div style={{ display: "grid", gridTemplateColumns: `repeat(auto-fill,minmax(${mobile ? 150 : 180}px,1fr))`, gap: 10 }}>
         {staffMap.map((s, i) => {
-          const [bg, col] = avCol(i); const over = s.hours > 40; const pct = Math.min(100, Math.round(s.hours / 40 * 100));
+          const [bg, col] = avCol(i);
+          const over = s.hours > 40;
+          const pct = Math.min(100, Math.round(s.hours / 40 * 100));
           return (
-            <div key={i} style={cardS({ padding: "10px 12px", borderColor: over ? "#fecaca" : "#e2e8f0" })}>
+            <div key={i} onClick={() => setSelected(s.name)}
+              style={cardS({ padding: "10px 12px", borderColor: over ? "#fecaca" : "#e2e8f0", cursor: "pointer" })}
+              onMouseEnter={e => e.currentTarget.style.background = "#f8fafc"}
+              onMouseLeave={e => e.currentTarget.style.background = "#fff"}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                 <div style={{ width: 32, height: 32, borderRadius: "50%", background: bg, color: col, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>{ini(s.name)}</div>
                 <div style={{ minWidth: 0 }}>
@@ -898,7 +1099,7 @@ function StaffPage({ staffMap, doubles, mobile }) {
                 </div>
                 <span style={{ fontSize: 14, fontWeight: 700, color: over ? "#dc2626" : s.hours === 40 ? "#16a34a" : "#d97706", flexShrink: 0, marginLeft: 4 }}>{s.hours}h</span>
               </div>
-              <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 3 }}>{s.hours}/40h this week</div>
+              <div style={{ fontSize: 9, color: "#94a3b8", marginTop: 3 }}>{s.hours}/40h · tap to view schedule</div>
             </div>
           );
         })}
