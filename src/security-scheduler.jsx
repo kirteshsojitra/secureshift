@@ -230,6 +230,24 @@ export default function App() {
 
   const weekDates = getWeekDates(weekOffset);
 
+  // Prevent browser zoom via keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === '+' || e.key === '-' || e.key === '=' || e.key === '0')) {
+        e.preventDefault();
+      }
+    };
+    const handleWheel = (e) => {
+      if (e.ctrlKey) e.preventDefault();
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.removeEventListener('wheel', handleWheel);
+    };
+  }, []);
+
   // ── Load all data from MongoDB on mount ──────────────────────────
   useEffect(() => {
     setLoading(true);
