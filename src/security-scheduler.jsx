@@ -438,6 +438,18 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
             {page === "schedule" && <select style={{ ...selS, width: "auto", minWidth: mobile ? 90 : 140, fontSize: 12, padding: "4px 8px" }} value={siteFilter} onChange={e => setSF(e.target.value)}><option value="ALL">All sites</option>{SITES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>}
+            {page === "schedule" && <button onClick={() => setModal({ type: "generate_schedule" })} style={{ ...btnS(false), padding: "5px 11px", fontSize: 12, display: "flex", alignItems: "center", gap: 5, flexShrink: 0, background: "#10b981", color: "#fff", border: "none" }}><span>⚡</span>{!mobile && <span style={{ marginLeft: 4 }}>Auto Schedule</span>}</button>}
+            {page === "schedule" && <button onClick={async () => {
+              if (!window.confirm(`Clear ALL assignments for the week of ${weekLabel(weekDates)}?\n\nThis cannot be undone.`)) return;
+              const weekKeys = new Set(weekDates.map(toDateKey));
+              const weekAssigns = assigns.filter(a => weekKeys.has(a.date));
+              if (!weekAssigns.length) { showToast("No assignments to clear", "warn"); return; }
+              showToast(`Clearing ${weekAssigns.length} assignments…`, "warn");
+              // Delete all in parallel — much faster than sequential
+              await Promise.all(weekAssigns.map(a => a._id ? deleteAssignment(a._id) : Promise.resolve()));
+              setAssigns(prev => prev.filter(a => !weekKeys.has(a.date)));
+              showToast(`✓ Cleared ${weekAssigns.length} assignments`, "warn");
+            }} style={{ ...btnS(false), padding: "5px 11px", fontSize: 12, display: "flex", alignItems: "center", gap: 5, flexShrink: 0, background: "#fff", color: "#dc2626", border: "1px solid #fecaca" }}><span>🗑</span>{!mobile && <span style={{ marginLeft: 4 }}>Clear week</span>}</button>}
             {page === "schedule" && <button onClick={() => printSchedule(patients, assigns, weekDates, siteFilter)} style={{ ...btnS(false), padding: "5px 11px", fontSize: 12, display: "flex", alignItems: "center", gap: 5, flexShrink: 0, background: "#0f172a", color: "#fff", border: "none" }}><span>🖨</span>{!mobile && <span style={{ marginLeft: 4 }}>Print / PDF</span>}</button>}
             {page === "patients" && <button style={{ ...btnS(true), padding: mobile ? "5px 10px" : "6px 13px", fontSize: 12 }} onClick={() => setModal({ type: "patient", data: { name: "", siteId: 1, room: "", watchLevel: "MEDIUM", status: "ACTIVE", notes: "", requiredShifts: [] } })}>+ Add patient</button>}
           </div>
@@ -467,6 +479,25 @@ export default function App() {
         onClose={() => setChatOpen(false)}
       />}
 
+      {modal?.type === "generate_schedule" && <GenerateScheduleModal
+        patients={patients} guards={guards} assigns={assigns}
+        weekDates={weekDates} mobile={mobile}
+        onGenerate={async newAssigns => {
+          // Save all to DB first, then set state once with real _ids
+          const existing = new Set(assigns.map(a => `${a.patientId}-${a.shift}-${a.date}`));
+          const toAdd = newAssigns.filter(a => !existing.has(`${a.patientId}-${a.shift}-${a.date}`));
+          if (!toAdd.length) { setModal(null); showToast("Nothing new to add", "warn"); return; }
+          try {
+            const saved = await Promise.all(toAdd.map(a => createAssignment(a)));
+            setAssigns(prev => [...prev, ...saved.map(s => ({ ...s, id: s._id }))]);
+            setModal(null);
+            showToast(`⚡ ${saved.length} shifts scheduled`, "ok");
+          } catch (err) {
+            showToast("Failed to save schedule", "err");
+          }
+        }}
+        onClose={() => setModal(null)}
+      />}
       {modal?.type === "assign" && <AssignModal modal={modal} patients={patients} assigns={assigns} guardAvailability={guardAvailability} mobile={mobile} weekDates={weekDates} onSave={saveAssign} onRemove={removeAssign} onClose={() => setModal(null)} />}
       {modal?.type === "patient" && <PatientModal data={modal.data} assigns={assigns} mobile={mobile} onSave={savePatient} onDelete={modal.data.id ? () => deletePatient(modal.data.id) : null} onClose={() => setModal(null)} />}
       {modal?.type === "paycheque" && <PaychequeModal guard={modal.guard} period={modal.period} assigns={assigns} mobile={mobile} onClose={() => setModal(null)} />}
@@ -2807,3 +2838,316 @@ function PaychequeModal({ guard, period, assigns, mobile, onClose }) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Canada Pension Plan (CPP) 2024
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO SCHEDULE GENERATOR
+// Respects: availability schedule, time off, book-off, one shift/day, hour limits
+// Skips guards who are unavailable — leaves those slots empty for manual fixing
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Check if a guard is valid for a given shift/date (all rules)
+// ─────────────────────────────────────────────────────────────────────────────
+function isGuardAvailable(g, shift, dk, dayIdx, hoursFor, assignedToday) {
+  if (isOnTimeOff(g, dk)) return { ok: false, reason: "time_off" };
+  const todayShifts = (g.schedule || {})[dayIdx] || [];
+  if (!todayShifts.length) return { ok: false, reason: "no_avail_day" };
+  if (!todayShifts.includes(shift)) return { ok: false, reason: "wrong_shift" };
+  if (assignedToday(g.name, dk)) return { ok: false, reason: "busy" };
+  const limit = g.employmentType === "Full-time" ? 40 : 24;
+  if (hoursFor(g.name) + (SHIFTS[shift]?.hours || 0) > limit) return { ok: false, reason: "over_limit" };
+  return { ok: true };
+}
+
+function generateSchedule(patients, guards, assigns, weekDates) {
+  const results = [];  // new assignments to add
+  const warnings = [];  // skipped — guard unavailable, leave empty for manual fix
+  const runHours = {};  // hours assigned this run per guard
+  const runDays = {};  // one shift per day tracking
+
+  const weekKeys = new Set(weekDates.map(toDateKey));
+
+  // Previous week dates (7 days before each current day)
+  const prevWeekKeys = weekDates.map(d => {
+    const prev = new Date(d);
+    prev.setDate(prev.getDate() - 7);
+    return toDateKey(prev);
+  });
+
+  // Build prev week map: patientId-shift-dayPosition -> staffName
+  const prevMap = {};
+  assigns.forEach(a => {
+    const idx = prevWeekKeys.indexOf(a.date);
+    if (idx !== -1) prevMap[`${a.patientId}-${a.shift}-${idx}`] = a.staff;
+  });
+
+  const hoursFor = (name) => {
+    const existing = assigns
+      .filter(a => a.staff.toLowerCase().trim() === name.toLowerCase().trim() && weekKeys.has(a.date))
+      .reduce((s, a) => s + (SHIFTS[a.shift]?.hours || 0), 0);
+    return existing + (runHours[name] || 0);
+  };
+
+  const assignedToday = (name, date) => {
+    if (runDays[`${name.toLowerCase().trim()}-${date}`]) return true;
+    return assigns.some(a => a.staff.toLowerCase().trim() === name.toLowerCase().trim() && a.date === date);
+  };
+
+  const watchOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+  const sortedPatients = [...patients]
+    .filter(p => p.status === 'ACTIVE')
+    .sort((a, b) => (watchOrder[a.watchLevel] ?? 2) - (watchOrder[b.watchLevel] ?? 2));
+
+  weekDates.forEach((d, dayPos) => {
+    const dk = toDateKey(d);
+    const dayIdx = dayIdxOfDate(dk);
+    const validShifts = shiftsForDayIdx(dayIdx);
+
+    sortedPatients.forEach(pat => {
+      const needed = pat.requiredShifts.filter(s => validShifts.includes(s));
+      needed.forEach(shift => {
+        // Skip if already assigned
+        const alreadyDone =
+          assigns.some(a => a.patientId === pat.id && a.shift === shift && a.date === dk) ||
+          results.some(a => a.patientId === pat.id && a.shift === shift && a.date === dk);
+        if (alreadyDone) return;
+
+        // Look up who did this shift last week
+        const prevStaff = prevMap[`${pat.id}-${shift}-${dayPos}`];
+
+        if (!prevStaff) {
+          // No previous assignment — skip, let scheduler fill manually
+          warnings.push({
+            patient: pat.name, shift, date: dk, dayLabel: fmtDate(d),
+            reason: 'No previous assignment — assign manually',
+          });
+          return;
+        }
+
+        // Find the guard record
+        const guard = guards.find(g => g.name.toLowerCase().trim() === prevStaff.toLowerCase().trim());
+
+        if (!guard) {
+          warnings.push({
+            patient: pat.name, shift, date: dk, dayLabel: fmtDate(d),
+            reason: `${prevStaff} no longer in system`,
+          });
+          return;
+        }
+
+        // Check all availability rules — if ANY fail, leave slot empty
+        const limit = guard.employmentType === 'Full-time' ? 40 : 24;
+        const todayShifts = (guard.schedule || {})[dayIdx] || [];
+
+        if (isOnTimeOff(guard, dk)) {
+          warnings.push({ patient: pat.name, shift, date: dk, dayLabel: fmtDate(d), reason: `${prevStaff} — on time off / book-off` }); return;
+        }
+        if (!todayShifts.length) {
+          warnings.push({ patient: pat.name, shift, date: dk, dayLabel: fmtDate(d), reason: `${prevStaff} — availability changed (no longer works ${DAYS[dayIdx]}s)` }); return;
+        }
+        if (!todayShifts.includes(shift)) {
+          warnings.push({ patient: pat.name, shift, date: dk, dayLabel: fmtDate(d), reason: `${prevStaff} — no longer available for ${SHIFTS[shift]?.label} on ${DAYS[dayIdx]}s` }); return;
+        }
+        if (assignedToday(guard.name, dk)) {
+          warnings.push({ patient: pat.name, shift, date: dk, dayLabel: fmtDate(d), reason: `${prevStaff} — already assigned to another shift today` }); return;
+        }
+        if (hoursFor(guard.name) + (SHIFTS[shift]?.hours || 0) > limit) {
+          warnings.push({ patient: pat.name, shift, date: dk, dayLabel: fmtDate(d), reason: `${prevStaff} — would exceed ${limit}h ${guard.employmentType} limit` }); return;
+        }
+
+        // All checks passed — assign same guard as last week
+        runHours[guard.name] = (runHours[guard.name] || 0) + (SHIFTS[shift]?.hours || 0);
+        runDays[`${guard.name.toLowerCase().trim()}-${dk}`] = true;
+        results.push({ patientId: pat.id, shift, date: dk, staff: guard.name });
+      });
+    });
+  });
+
+  return { results, warnings, replaced: [] };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GENERATE SCHEDULE MODAL
+// ─────────────────────────────────────────────────────────────────────────────
+function GenerateScheduleModal({ patients, guards, assigns, weekDates, mobile, onGenerate, onClose }) {
+  const [preview, setPreview] = useState(null);  // { results, warnings }
+  const [generated, setGenerated] = useState(false);
+
+  const run = () => {
+    const result = generateSchedule(patients, guards, assigns, weekDates);
+    setPreview(result);
+    setGenerated(true);
+  };
+
+  const overlayStyle = { position: "fixed", inset: 0, background: "rgba(15,23,42,.6)", display: "flex", alignItems: mobile ? "flex-end" : "center", justifyContent: "center", zIndex: 50 };
+  const modalStyle = { background: "#fff", borderRadius: mobile ? "14px 14px 0 0" : "14px", width: "100%", maxWidth: mobile ? "100%" : "560px", maxHeight: "92vh", display: "flex", flexDirection: "column" };
+
+  const filled = preview?.results?.length || 0;
+  const skipped = preview?.warnings?.length || 0;
+
+  return (
+    <div style={overlayStyle} onClick={onClose}>
+      <div style={modalStyle} onClick={e => e.stopPropagation()}>
+
+        {/* Header */}
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #e2e8f0", flexShrink: 0 }}>
+          <div style={{ fontSize: 15, fontWeight: 700, color: "#0f172a" }}>⚡ Auto Schedule Generator</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+            Automatically fills open shifts based on guard availability, time off and hour limits.
+          </div>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding: "16px 20px", flex: 1, overflowY: "auto" }}>
+
+          {!generated ? (
+            /* Pre-run info */
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 10, padding: "12px 14px", fontSize: 12, color: "#14532d" }}>
+                ✓ <strong>What this does:</strong> Copies last week's schedule exactly — same guard, same shift, same patient:
+                <ul style={{ marginTop: 6, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 3 }}>
+                  <li><strong>Same guard as last week</strong> — no substitutions</li>
+                  <li>If guard is on time off, book-off, or availability changed → slot left <strong>empty</strong> for manual fix</li>
+                  <li>One shift per day rule enforced</li>
+                  <li>40h full-time / 24h part-time limit respected</li>
+                  <li>HIGH watch patients filled first</li>
+                  <li>Won't overwrite existing assignments</li>
+                </ul>
+              </div>
+              <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 10, padding: "12px 14px", fontSize: 12, color: "#92400e" }}>
+                ⚠ <strong>Will not overwrite</strong> existing assignments — only fills empty slots. You can review before applying.
+              </div>
+              <div style={{ background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 10, padding: "12px 14px", fontSize: 12, color: "#374151" }}>
+                📋 Week: <strong>{fmtDate(weekDates[0])} – {fmtDate(weekDates[6])}</strong><br />
+                Patients: <strong>{patients.filter(p => p.status === "ACTIVE").length}</strong> active · Guards: <strong>{guards.length}</strong>
+              </div>
+            </div>
+          ) : (
+            /* Preview results */
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {/* Summary */}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 10, padding: "12px 10px", textAlign: "center" }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: "#16a34a" }}>{filled}</div>
+                  <div style={{ fontSize: 10, color: "#14532d" }}>Shifts to assign</div>
+                </div>
+                <div style={{ background: (preview?.replaced?.length || 0) > 0 ? "#fffbeb" : "#f0fdf4", border: `1px solid ${(preview?.replaced?.length || 0) > 0 ? "#fcd34d" : "#86efac"}`, borderRadius: 10, padding: "12px 10px", textAlign: "center" }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: (preview?.replaced?.length || 0) > 0 ? "#d97706" : "#16a34a" }}>{preview?.replaced?.length || 0}</div>
+                  <div style={{ fontSize: 10, color: (preview?.replaced?.length || 0) > 0 ? "#92400e" : "#14532d" }}>Replacements</div>
+                </div>
+                <div style={{ background: skipped > 0 ? "#fef2f2" : "#f0fdf4", border: `1px solid ${skipped > 0 ? "#fecaca" : "#86efac"}`, borderRadius: 10, padding: "12px 10px", textAlign: "center" }}>
+                  <div style={{ fontSize: 22, fontWeight: 700, color: skipped > 0 ? "#dc2626" : "#16a34a" }}>{skipped}</div>
+                  <div style={{ fontSize: 10, color: skipped > 0 ? "#991b1b" : "#14532d" }}>Skipped</div>
+                </div>
+              </div>
+
+              {/* Summary stats */}
+              {preview.replaced?.length > 0 && (
+                <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 10, padding: "10px 14px", fontSize: 12, color: "#92400e" }}>
+                  ⚠ <strong>{preview.replaced.length}</strong> slot{preview.replaced.length !== 1 ? "s" : ""} needed a replacement guard (prev guard unavailable)
+                </div>
+              )}
+
+              {/* Assignments preview */}
+              {filled > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Will assign ({filled})</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5, maxHeight: 200, overflowY: "auto" }}>
+                    {preview.results.map((a, i) => {
+                      const pat = patients.find(p => p.id === a.patientId);
+                      const sh = SHIFTS[a.shift];
+                      const isReplaced = preview.replaced?.some(r => r.patient === pat?.name && r.shift === a.shift && r.date === a.date);
+                      const replInfo = preview.replaced?.find(r => r.patient === pat?.name && r.shift === a.shift && r.date === a.date);
+                      return (
+                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", background: isReplaced ? "#fffbeb" : "#f8fafc", borderRadius: 8, border: `1px solid ${isReplaced ? "#fcd34d" : "#e2e8f0"}`, fontSize: 11 }}>
+                          <span style={{ ...pill(sh?.bg, sh?.color), fontSize: 9 }}>{sh?.label}</span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ color: "#374151", fontWeight: 500 }}>{a.staff}</span>
+                              {isReplaced && <span style={{ fontSize: 9, color: "#92400e" }}>↩ replaces {replInfo?.prevStaff}</span>}
+                            </div>
+                            <div style={{ fontSize: 9, color: "#94a3b8" }}>{pat?.name} · {a.date}</div>
+                          </div>
+                          {isReplaced && <span style={{ fontSize: 9, color: "#d97706" }}>⚠ sub</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Replacements detail */}
+              {preview.replaced?.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Replacements ({preview.replaced.length})</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5, maxHeight: 140, overflowY: "auto" }}>
+                    {preview.replaced.map((r, i) => (
+                      <div key={i} style={{ padding: "7px 10px", background: "#fffbeb", borderRadius: 8, border: "1px solid #fcd34d", fontSize: 11 }}>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 2 }}>
+                          <span style={{ ...pill(SHIFTS[r.shift]?.bg, SHIFTS[r.shift]?.color), fontSize: 9 }}>{SHIFTS[r.shift]?.label}</span>
+                          <span style={{ color: "#374151" }}>{r.patient} · {r.dayLabel}</span>
+                        </div>
+                        <div style={{ color: "#92400e", fontSize: 10 }}>
+                          <span style={{ textDecoration: "line-through", color: "#b45309" }}>{r.prevStaff}</span>
+                          <span style={{ margin: "0 4px" }}>→</span>
+                          <strong>{r.newStaff}</strong>
+                          <span style={{ color: "#b45309", marginLeft: 6 }}>({r.reason})</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Warnings */}
+              {skipped > 0 && (
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Skipped — fix manually ({skipped})</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 5, maxHeight: 180, overflowY: "auto" }}>
+                    {preview.warnings.map((w, i) => (
+                      <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "7px 10px", background: "#fffbeb", borderRadius: 8, border: "1px solid #fcd34d", fontSize: 11 }}>
+                        <span style={{ fontSize: 13, flexShrink: 0 }}>⚠</span>
+                        <div>
+                          <div style={{ fontWeight: 500, color: "#92400e" }}>{w.patient} · {SHIFTS[w.shift]?.label} · {w.dayLabel}</div>
+                          <div style={{ color: "#b45309", marginTop: 1 }}>{w.reason}</div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {filled === 0 && skipped === 0 && (
+                <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 10, padding: "14px", textAlign: "center", fontSize: 13, color: "#14532d" }}>
+                  ✅ All shifts are already assigned — nothing to do!
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: "12px 20px", borderTop: "1px solid #e2e8f0", display: "flex", gap: 8, justifyContent: "flex-end", flexShrink: 0 }}>
+          <button style={btnS(false)} onClick={onClose}>Cancel</button>
+          {!generated ? (
+            <button style={{ ...btnS(true), background: "#10b981" }} onClick={run}>
+              ⚡ Preview schedule
+            </button>
+          ) : (
+            <>
+              <button style={{ ...btnS(false) }} onClick={() => { setGenerated(false); setPreview(null); }}>
+                ← Re-run
+              </button>
+              {filled > 0 && (
+                <button style={{ ...btnS(true), background: "#10b981" }} onClick={() => onGenerate(preview.results)}>
+                  ✓ Apply {filled} assignments
+                </button>
+              )}
+              {filled === 0 && (
+                <button style={btnS(false)} onClick={onClose}>Close</button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
