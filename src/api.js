@@ -1,4 +1,4 @@
-const BASE = 'http://localhost:5001/api';
+const BASE = 'https://secureshift-api.onrender.com/api';
 
 // ── Patients ──────────────────────────────────────────────────────
 export const fetchPatients = () => fetch(`${BASE}/patients`).then(r => r.json());
