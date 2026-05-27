@@ -1446,7 +1446,16 @@ function GuardsPage({ guards, mobile, onEdit, onAdd }) {
               {/* Contact */}
               <div style={{ padding: "9px 14px", borderBottom: "1px solid #f8f9fb", display: "flex", flexDirection: "column", gap: 3 }}>
                 {g.site && <div style={{ fontSize: 11, color: "#374151", display: "flex", gap: 5, alignItems: "center" }}><span>📍</span>{g.site}</div>}
-                {g.phone && <div style={{ fontSize: 11, color: "#374151", display: "flex", gap: 5, alignItems: "center" }}><span>📞</span>{g.phone}</div>}
+                {g.phone && (
+                  <a href={`tel:${g.phone.replace(/\s/g, "")}`}
+                    style={{ fontSize: 11, color: "#374151", display: "flex", gap: 5, alignItems: "center", textDecoration: "none", padding: "3px 8px", borderRadius: 6, background: "#f0fdf4", border: "0.5px solid #86efac", width: "fit-content", cursor: "pointer" }}
+                    onMouseEnter={e => e.currentTarget.style.background = "#dcfce7"}
+                    onMouseLeave={e => e.currentTarget.style.background = "#f0fdf4"}>
+                    <span>📞</span>
+                    <span style={{ color: "#15803d", fontWeight: 500 }}>{g.phone}</span>
+                    <span style={{ fontSize: 9, color: "#16a34a", marginLeft: 2 }}>Call</span>
+                  </a>
+                )}
                 {g.email && <div style={{ fontSize: 11, color: "#374151", display: "flex", gap: 5, alignItems: "center" }}><span>✉</span>{g.email}</div>}
                 {!g.site && !g.phone && !g.email && <div style={{ fontSize: 10, color: "#94a3b8" }}>No contact info</div>}
               </div>
