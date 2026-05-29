@@ -5,6 +5,7 @@ import {
   fetchAssignments, createAssignment, deleteAssignment,
 } from "./api";
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Shift definitions
 // Mon–Fri: AM (07–15, 8h), PM (15–23, 8h), NIGHT (23–07, 8h)
@@ -267,6 +268,10 @@ export default function App() {
 
   const showToast = (msg, type = "ok") => { setToast({ msg, type }); setTimeout(() => setToast(null), 3000); };
   const getAssign = (pid, sh, date) => assigns.find(a => a.patientId === pid && a.shift === sh && a.date === date);
+  // Deduplicated assigns for display/calculation (removes any DB duplicate records)
+  const dedupeAssigns = assigns.filter((a, idx, arr) =>
+    idx === arr.findIndex(b => b.patientId === a.patientId && b.shift === a.shift && b.date === a.date)
+  );
 
   // gaps across the whole week, respecting which shifts are valid per day
   const gaps = patients.filter(p => p.status === "ACTIVE").flatMap(p =>
@@ -284,7 +289,11 @@ export default function App() {
     const map = new Map();
     patients.forEach(pat => {
       const st = siteOf(pat.siteId);
+      const seenKeys = new Set();
       assigns.filter(a => a.patientId === pat.id && weekKeys.has(a.date)).forEach(a => {
+        const dupKey = `${a.patientId}-${a.shift}-${a.date}`;
+        if (seenKeys.has(dupKey)) return; // skip DB duplicates
+        seenKeys.add(dupKey);
         const k = a.staff.toLowerCase().trim();
         if (!map.has(k)) map.set(k, { name: a.staff, site: st.name, color: st.color, assignments: [], hours: 0 });
         map.get(k).assignments.push({ patient: pat.name, shift: a.shift, hours: SHIFTS[a.shift]?.hours || 0, date: a.date });
@@ -299,8 +308,17 @@ export default function App() {
   const doublesSet = new Map();
   weekDates.forEach(d => {
     const dk = toDateKey(d);
+    // Deduplicate assigns by patientId+shift+date first (removes DB duplicates)
+    const seen = new Set();
+    const uniqueAssigns = assigns.filter(a => {
+      if (a.date !== dk) return false;
+      const key = `${a.patientId}-${a.shift}-${a.date}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     const dayMap = new Map();
-    assigns.filter(a => a.date === dk).forEach(a => {
+    uniqueAssigns.forEach(a => {
       const k = a.staff.toLowerCase().trim();
       if (!dayMap.has(k)) dayMap.set(k, { name: a.staff, shifts: [], hours: 0 });
       dayMap.get(k).shifts.push(a.shift);
@@ -380,6 +398,7 @@ export default function App() {
     ["guards", "🪪", "Guard availability", "Main"], ["staff", "👮", "Staff hours", "Main"], ["sites", "📍", "Sites", "Main"],
     ["alerts", "🔔", totalAlerts > 0 ? `Alerts (${totalAlerts})` : "Alerts", "Reports"],
     ["payroll", "💰", "Payroll", "Reports"],
+    ["suggestions", "🧠", "AI Suggestions", "Reports"],
   ];
 
   const sidebarStyle = mobile ? { position: "fixed", top: 0, left: 0, height: "100%", zIndex: 45, width: 210, background: "#0f172a", display: "flex", flexDirection: "column", transform: sidebarOpen ? "translateX(0)" : "translateX(-100%)", transition: "transform .25s ease", flexShrink: 0 } : { width: 215, background: "#0f172a", display: "flex", flexDirection: "column", flexShrink: 0 };
@@ -425,7 +444,7 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, flex: 1 }}>
             {mobile && <button onClick={() => setSidebar(true)} style={{ background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#374151", padding: "2px", lineHeight: 1, flexShrink: 0 }}>☰</button>}
             <span style={{ fontSize: mobile ? 13 : 15, fontWeight: 700, color: "#0f172a", letterSpacing: "-0.02em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {page === "schedule" ? "Schedule" : page === "patients" ? "Patients" : page === "guards" ? "Guard availability" : page === "staff" ? "Staff hours" : page === "sites" ? "Sites" : page === "payroll" ? "Payroll" : "Alerts"}
+              {page === "schedule" ? "Schedule" : page === "patients" ? "Patients" : page === "guards" ? "Guard availability" : page === "staff" ? "Staff hours" : page === "sites" ? "Sites" : page === "payroll" ? "Payroll" : page === "suggestions" ? "AI Suggestions" : "Alerts"}
             </span>
             {page === "schedule" && (
               <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
@@ -466,6 +485,7 @@ export default function App() {
           {page === "staff" && <StaffPage staffMap={staffMap} doubles={doubles} mobile={mobile} weekDates={weekDates} guards={guards} />}
           {page === "sites" && <SitesPage patients={patients} assigns={assigns} weekDates={weekDates} getAssign={getAssign} />}
           {page === "alerts" && <AlertsPage gaps={gaps} doubles={doubles} patients={patients} onFix={navTo} onAssign={(pid, sh, date) => setModal({ type: "assign", patientId: pid, shift: sh, date, current: getAssign(pid, sh, date)?.staff || "" })} />}
+          {page === "suggestions" && <SuggestionsPage assigns={assigns} patients={patients} guards={guards} weekDates={weekDates} mobile={mobile} onAssign={(pid, sh, date) => setModal({ type: "assign", patientId: pid, shift: sh, date, current: getAssign(pid, sh, date)?.staff || "" })} />}
           {page === "payroll" && <PayrollPage guards={guards} assigns={assigns} setGuards={setGuards} mobile={mobile}
             onPaycheque={(g, period) => setModal({ type: "paycheque", guard: g, period })} />}
         </div>
@@ -483,22 +503,31 @@ export default function App() {
         patients={patients} guards={guards} assigns={assigns}
         weekDates={weekDates} mobile={mobile}
         onGenerate={async newAssigns => {
-          // Save all to DB first, then set state once with real _ids
-          const existing = new Set(assigns.map(a => `${a.patientId}-${a.shift}-${a.date}`));
-          const toAdd = newAssigns.filter(a => !existing.has(`${a.patientId}-${a.shift}-${a.date}`));
-          if (!toAdd.length) { setModal(null); showToast("Nothing new to add", "warn"); return; }
-          try {
-            const saved = await Promise.all(toAdd.map(a => createAssignment(a)));
-            setAssigns(prev => [...prev, ...saved.map(s => ({ ...s, id: s._id }))]);
-            setModal(null);
-            showToast(`⚡ ${saved.length} shifts scheduled`, "ok");
-          } catch (err) {
-            showToast("Failed to save schedule", "err");
-          }
+          // Use functional setAssigns to get latest state and deduplicate properly
+          setModal(null);
+          setAssigns(prev => {
+            const existing = new Set(prev.map(a => `${a.patientId}-${a.shift}-${a.date}`));
+            const toAdd = newAssigns.filter(a => !existing.has(`${a.patientId}-${a.shift}-${a.date}`));
+            if (!toAdd.length) { showToast("Nothing new to add", "warn"); return prev; }
+            // Save to DB in background — do NOT update state again after (prevents double-count)
+            toAdd.forEach(a => {
+              createAssignment(a).then(saved => {
+                // Update only the _id on the already-added record
+                setAssigns(p => p.map(x =>
+                  x.patientId === a.patientId && x.shift === a.shift && x.date === a.date && !x._id
+                    ? { ...saved, id: saved._id }
+                    : x
+                ));
+              }).catch(() => { });
+            });
+            showToast(`⚡ ${toAdd.length} shifts scheduled`, "ok");
+            // Add to state immediately (without _id — _id filled in above when DB responds)
+            return [...prev, ...toAdd];
+          });
         }}
         onClose={() => setModal(null)}
       />}
-      {modal?.type === "assign" && <AssignModal modal={modal} patients={patients} assigns={assigns} guardAvailability={guardAvailability} mobile={mobile} weekDates={weekDates} onSave={saveAssign} onRemove={removeAssign} onClose={() => setModal(null)} />}
+      {modal?.type === "assign" && <AssignModal modal={modal} patients={patients} assigns={assigns} guardAvailability={guardAvailability} mobile={mobile} weekDates={weekDates} onSave={saveAssign} onRemove={removeAssign} onClose={() => setModal(null)} allAssigns={assigns} />}
       {modal?.type === "patient" && <PatientModal data={modal.data} assigns={assigns} mobile={mobile} onSave={savePatient} onDelete={modal.data.id ? () => deletePatient(modal.data.id) : null} onClose={() => setModal(null)} />}
       {modal?.type === "paycheque" && <PaychequeModal guard={modal.guard} period={modal.period} assigns={assigns} mobile={mobile} onClose={() => setModal(null)} />}
       {modal?.type === "guard_modal" && <GuardModal data={modal.data} mobile={mobile}
@@ -1226,8 +1255,16 @@ function AlertsPage({ gaps, doubles, patients, onFix, onAssign }) {
 function guardWeeklyHours(staffName, assigns, weekDates) {
   const n = staffName.toLowerCase().trim();
   const weekKeys = new Set(weekDates.map(toDateKey));
+  // Deduplicate by patientId+shift+date to avoid counting DB duplicates twice
+  const seen = new Set();
   return assigns
-    .filter(a => a.staff.toLowerCase().trim() === n && weekKeys.has(a.date))
+    .filter(a => {
+      if (a.staff.toLowerCase().trim() !== n || !weekKeys.has(a.date)) return false;
+      const key = `${a.patientId}-${a.shift}-${a.date}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .reduce((sum, a) => sum + (SHIFTS[a.shift]?.hours || 0), 0);
 }
 
@@ -1309,7 +1346,7 @@ function buildAvailableGuards(shift, date, assigns, guardAvailability, excludePa
 // ─────────────────────────────────────────────────────────────────────────────
 // Assign Modal — smart dropdown of available guards
 // ─────────────────────────────────────────────────────────────────────────────
-function AssignModal({ modal, patients, assigns, guardAvailability, mobile, weekDates, onSave, onRemove, onClose }) {
+function AssignModal({ modal, patients, assigns, guardAvailability, mobile, weekDates, onSave, onRemove, onClose, allAssigns }) {
   const [name, setName] = useState(modal.current || "");
   const [query, setQuery] = useState(modal.current || "");
   const [showDrop, setShowDrop] = useState(false);
@@ -1324,9 +1361,25 @@ function AssignModal({ modal, patients, assigns, guardAvailability, mobile, week
     modal.shift, modal.date, assigns, guardAvailability, modal.patientId, weekDates
   );
 
+  // AI scoring — learn from all historical assignments
+  const aiPatterns = (allAssigns?.length > 0) ? learnPatterns(allAssigns, patients, guardAvailability) : null;
+  const aiScores = {};
+  if (aiPatterns) {
+    const aiSuggestions = getSuggestions(modal.patientId, modal.shift, modal.date, aiPatterns, guardAvailability, allAssigns, weekDates, 99);
+    aiSuggestions.forEach((s, idx) => { aiScores[s.name] = { score: s.score, rank: idx, confidence: s.confidence, affinityCount: s.affinityCount, slotCount: s.slotCount }; });
+  }
+
+  // Sort available guards by AI score (highest first), fallback to hours
+  const sortedAvail = [...available].sort((a, b) => {
+    const sa = aiScores[a.name]?.score ?? -1;
+    const sb = aiScores[b.name]?.score ?? -1;
+    if (sb !== sa) return sb - sa;
+    return a.weekHrs - b.weekHrs;
+  });
+
   // Filter by search query
   const q = query.toLowerCase().trim();
-  const filteredAvail = q ? available.filter(g => g.name.toLowerCase().includes(q)) : available;
+  const filteredAvail = q ? sortedAvail.filter(g => g.name.toLowerCase().includes(q)) : sortedAvail;
   const filteredUnavail = q ? unavailable.filter(g => g.name.toLowerCase().includes(q)) : unavailable;
 
   // Validation for typed/selected name
@@ -1399,19 +1452,30 @@ function AssignModal({ modal, patients, assigns, guardAvailability, mobile, week
               {filteredAvail.length > 0 && (
                 <div>
                   <div style={{ padding: "6px 12px", fontSize: 10, fontWeight: 700, color: "#16a34a", background: "#f0fdf4", borderBottom: "1px solid #dcfce7", textTransform: "uppercase", letterSpacing: "0.05em", position: "sticky", top: 0 }}>
-                    ✓ Available — {filteredAvail.length} guard{filteredAvail.length !== 1 ? "s" : ""}
+                    ✓ Available — {filteredAvail.length} guard{filteredAvail.length !== 1 ? "s" : ""}{aiPatterns ? " · 🧠 AI ranked" : ""}
                   </div>
                   {filteredAvail.map((g, i) => {
                     const pct = Math.min(100, Math.round((g.weekHrs / (g.limit || 40)) * 100));
                     const hasWarn = !!g.warn;
-                    const rowBg = name === g.name ? (hasWarn ? "#fffbeb" : "#f0fdf4") : "#fff";
+                    const isTopAI = aiScores[g.name]?.rank === 0;
+                    const rowBg = name === g.name ? (hasWarn ? "#fffbeb" : "#f0fdf4") : isTopAI ? "#fffbeb" : "#fff";
                     return (
                       <div key={i} onClick={() => selectGuard(g.name)}
-                        style={{ padding: "9px 12px", cursor: "pointer", borderBottom: "1px solid #f8f9fb", background: rowBg, borderLeft: hasWarn ? "3px solid #f59e0b" : "3px solid transparent" }}
+                        style={{ padding: "9px 12px", cursor: "pointer", borderBottom: "1px solid #f8f9fb", background: rowBg, borderLeft: hasWarn ? "3px solid #f59e0b" : isTopAI ? "3px solid #f59e0b" : "3px solid transparent" }}
                         onMouseEnter={e => e.currentTarget.style.background = hasWarn ? "#fffbeb" : "#f8fafc"}
                         onMouseLeave={e => e.currentTarget.style.background = rowBg}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 3 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                            {/* AI rank badge — top 3 */}
+                            {aiScores[g.name] && aiScores[g.name].rank === 0 && (
+                              <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 8, background: "#fef3c7", color: "#92400e", fontWeight: 700, border: "1px solid #fcd34d" }}>🧠 #1 AI pick</span>
+                            )}
+                            {aiScores[g.name] && aiScores[g.name].rank === 1 && (
+                              <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 8, background: "#f0f9ff", color: "#0369a1", fontWeight: 600, border: "1px solid #bae6fd" }}>🧠 #2</span>
+                            )}
+                            {aiScores[g.name] && aiScores[g.name].rank === 2 && (
+                              <span style={{ fontSize: 9, padding: "1px 6px", borderRadius: 8, background: "#f8fafc", color: "#64748b", fontWeight: 600, border: "1px solid #e2e8f0" }}>🧠 #3</span>
+                            )}
                             <span style={{ fontSize: 12, fontWeight: 500, color: "#0f172a" }}>{g.name}</span>
                             {g.empType && g.empType !== "Full-time" && <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 8, background: "#ede9fe", color: "#4f46e5", fontWeight: 600 }}>{g.empType}</span>}
                           </div>
@@ -1426,7 +1490,12 @@ function AssignModal({ modal, patients, assigns, guardAvailability, mobile, week
                         </div>
                         {hasWarn
                           ? <div style={{ fontSize: 9, color: "#d97706", fontWeight: 500 }}>⚠ {g.warn}</div>
-                          : <div style={{ fontSize: 9, color: "#94a3b8" }}>{g.weekHrs}/{g.limit || 40}h this week · +{sh.hours}h if assigned</div>
+                          : <div style={{ display: "flex", gap: 8, fontSize: 9, color: "#94a3b8" }}>
+                            <span>{g.weekHrs}/{g.limit || 40}h this week · +{sh.hours}h if assigned</span>
+                            {aiScores[g.name]?.affinityCount > 0 && (
+                              <span style={{ color: "#16a34a" }}>🔁 assigned here {aiScores[g.name].affinityCount}× before</span>
+                            )}
+                          </div>
                         }
                       </div>
                     );
@@ -3148,6 +3217,450 @@ function GenerateScheduleModal({ patients, guards, assigns, weekDates, mobile, o
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATTERN LEARNING ENGINE
+// Learns from ALL historical assignment data — no external API needed
+// ─────────────────────────────────────────────────────────────────────────────
+
+function learnPatterns(assigns, patients, guards) {
+  // ── 1. Guard → Patient affinity ───────────────────────────────────────────
+  // How many times has guard G been assigned to patient P on shift S?
+  const affinity = {}; // `guardName-patientId-shift` -> count
+  assigns.forEach(a => {
+    const key = `${a.staff.toLowerCase().trim()}-${a.patientId}-${a.shift}`;
+    affinity[key] = (affinity[key] || 0) + 1;
+  });
+
+  // ── 2. Guard → Day-of-week reliability ────────────────────────────────────
+  // How consistent is guard G on day D?
+  const dayReliability = {}; // guardName-dayIdx -> count
+  assigns.forEach(a => {
+    const di = dayIdxOfDate(a.date);
+    const key = `${a.staff.toLowerCase().trim()}-${di}`;
+    dayReliability[key] = (dayReliability[key] || 0) + 1;
+  });
+
+  // ── 3. Shift preference ────────────────────────────────────────────────────
+  const shiftPref = {}; // guardName-shift -> count
+  assigns.forEach(a => {
+    const key = `${a.staff.toLowerCase().trim()}-${a.shift}`;
+    shiftPref[key] = (shiftPref[key] || 0) + 1;
+  });
+
+  // ── 4. Most common guard per patient+shift slot ────────────────────────────
+  const slotBest = {}; // patientId-shift -> [{guard,count}]
+  assigns.forEach(a => {
+    const key = `${a.patientId}-${a.shift}`;
+    if (!slotBest[key]) slotBest[key] = {};
+    const n = a.staff.toLowerCase().trim();
+    slotBest[key][n] = (slotBest[key][n] || 0) + 1;
+  });
+
+  // ── 5. Guard workload trend (last 4 weeks) ────────────────────────────────
+  const fourWeeksAgo = new Date();
+  fourWeeksAgo.setDate(fourWeeksAgo.getDate() - 28);
+  const recentKey = toDateKey(fourWeeksAgo);
+  const recentHours = {}; // guardName -> hours in last 4 weeks
+  assigns.filter(a => a.date >= recentKey).forEach(a => {
+    const n = a.staff.toLowerCase().trim();
+    recentHours[n] = (recentHours[n] || 0) + (SHIFTS[a.shift]?.hours || 0);
+  });
+
+  // ── 6. Coverage consistency ────────────────────────────────────────────────
+  // For each patient+shift, how often was it covered vs missed?
+  const coverageRate = {}; // patientId-shift -> {covered, total}
+  // (we compute this from actual data — if assigned = covered)
+  assigns.forEach(a => {
+    const key = `${a.patientId}-${a.shift}`;
+    if (!coverageRate[key]) coverageRate[key] = { covered: 0 };
+    coverageRate[key].covered++;
+  });
+
+  return { affinity, dayReliability, shiftPref, slotBest, recentHours };
+}
+
+// Get top N suggestions for a patient+shift slot
+function getSuggestions(patientId, shift, dateKey, patterns, guards, assigns, weekDates, topN = 5) {
+  const dayIdx = dayIdxOfDate(dateKey);
+  const weekKeys = new Set(weekDates.map(toDateKey));
+
+  return guards.map(g => {
+    const n = g.name.toLowerCase().trim();
+
+    // Hard blocks — same as scheduler
+    if (isOnTimeOff(g, dateKey)) return null;
+    const todayShifts = (g.schedule || {})[dayIdx] || [];
+    if (!todayShifts.length || !todayShifts.includes(shift)) return null;
+    const alreadyToday = assigns.some(a => a.staff.toLowerCase().trim() === n && a.date === dateKey);
+    if (alreadyToday) return null;
+
+    // ── Score calculation ──────────────────────────────────────────────────
+    let score = 0;
+
+    // Affinity with this patient+shift (highest weight)
+    const affinityScore = patterns.affinity[`${n}-${patientId}-${shift}`] || 0;
+    score += affinityScore * 10;
+
+    // Day-of-week reliability
+    const dayScore = patterns.dayReliability[`${n}-${dayIdx}`] || 0;
+    score += dayScore * 3;
+
+    // Shift preference
+    const shiftScore = patterns.shiftPref[`${n}-${shift}`] || 0;
+    score += shiftScore * 4;
+
+    // Prefer guards with fewer recent hours (less fatigued)
+    const recentH = patterns.recentHours[n] || 0;
+    score += Math.max(0, 160 - recentH); // 160h = max 4 weeks full-time
+
+    // Current week hours (prefer least-loaded)
+    const weekHrs = assigns
+      .filter(a => a.staff.toLowerCase().trim() === n && weekKeys.has(a.date))
+      .reduce((s, a) => s + (SHIFTS[a.shift]?.hours || 0), 0);
+    const limit = g.employmentType === "Full-time" ? 40 : 24;
+    const remaining = limit - weekHrs;
+    if (remaining < (SHIFTS[shift]?.hours || 0)) score -= 200; // over limit — penalise but don't block
+
+    // Most common for this slot
+    const slotCounts = patterns.slotBest[`${patientId}-${shift}`] || {};
+    const slotRank = slotCounts[n] || 0;
+    score += slotRank * 8;
+
+    const hoursAfter = weekHrs + (SHIFTS[shift]?.hours || 0);
+    const overLimit = hoursAfter > limit;
+
+    return {
+      name: g.name,
+      score,
+      affinityCount: affinityScore,
+      slotCount: slotRank,
+      weekHrs,
+      hoursAfter,
+      limit,
+      empType: g.employmentType || "Full-time",
+      overLimit,
+      recentHours: recentH,
+      confidence: affinityScore > 5 ? "high" : affinityScore > 2 ? "medium" : "low",
+    };
+  })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+}
+
+// Detect scheduling insights from historical data
+function detectInsights(assigns, patients, guards, weekDates) {
+  const insights = [];
+  const weekKeys = new Set(weekDates.map(toDateKey));
+
+  // ── Overloaded guards (this week) ─────────────────────────────────────────
+  const guardHrs = {};
+  assigns.filter(a => weekKeys.has(a.date)).forEach(a => {
+    guardHrs[a.staff] = (guardHrs[a.staff] || 0) + (SHIFTS[a.shift]?.hours || 0);
+  });
+  Object.entries(guardHrs).forEach(([name, hrs]) => {
+    const g = guards.find(x => x.name === name);
+    const limit = g?.employmentType === "Full-time" ? 40 : 24;
+    if (hrs > limit) {
+      insights.push({ type: "warning", icon: "⚠️", title: `${name} is over limit`, body: `${hrs}h this week — exceeds ${limit}h ${g?.employmentType || ""} limit`, action: null });
+    }
+  });
+
+  // ── Guards not used this week but available ───────────────────────────────
+  const usedThisWeek = new Set(assigns.filter(a => weekKeys.has(a.date)).map(a => a.staff.toLowerCase().trim()));
+  const unusedAvail = guards.filter(g => {
+    if (usedThisWeek.has(g.name.toLowerCase().trim())) return false;
+    const hasAvail = weekDates.some(d => {
+      const di = dayIdxOfDate(toDateKey(d));
+      return (g.schedule?.[di]?.length || 0) > 0 && !isOnTimeOff(g, toDateKey(d));
+    });
+    return hasAvail;
+  });
+  if (unusedAvail.length > 0) {
+    insights.push({ type: "info", icon: "💡", title: `${unusedAvail.length} available guard${unusedAvail.length > 1 ? "s" : ""} not scheduled`, body: unusedAvail.slice(0, 3).map(g => g.name).join(", ") + (unusedAvail.length > 3 ? ` +${unusedAvail.length - 3} more` : ""), action: null });
+  }
+
+  // ── Guards on time off this week ──────────────────────────────────────────
+  const onTimeOff = guards.filter(g => weekDates.some(d => isOnTimeOff(g, toDateKey(d))));
+  if (onTimeOff.length > 0) {
+    insights.push({ type: "info", icon: "🏖", title: `${onTimeOff.length} guard${onTimeOff.length > 1 ? "s" : ""} on time off this week`, body: onTimeOff.map(g => g.name).join(", "), action: null });
+  }
+
+  // ── Most reliable guard (highest assignment count overall) ────────────────
+  const allCounts = {};
+  assigns.forEach(a => { allCounts[a.staff] = (allCounts[a.staff] || 0) + 1; });
+  const topGuard = Object.entries(allCounts).sort((a, b) => b[1] - a[1])[0];
+  if (topGuard) {
+    insights.push({ type: "success", icon: "⭐", title: `Most scheduled: ${topGuard[0]}`, body: `${topGuard[1]} total shift assignments in history`, action: null });
+  }
+
+  // ── Patient with most coverage gaps historically ───────────────────────────
+  const patGaps = {};
+  patients.filter(p => p.status === "ACTIVE").forEach(p => {
+    const covered = assigns.filter(a => a.patientId === p.id).length;
+    patGaps[p.name] = covered;
+  });
+  const leastCovered = Object.entries(patGaps).sort((a, b) => a[1] - b[1])[0];
+  if (leastCovered) {
+    insights.push({ type: leastCovered[1] < 5 ? "warning" : "info", icon: "🏥", title: `${leastCovered[0]} has fewest assignments`, body: `${leastCovered[1]} total shifts assigned historically — may need attention`, action: null });
+  }
+
+  return insights;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUGGESTIONS PAGE
+// ─────────────────────────────────────────────────────────────────────────────
+function SuggestionsPage({ assigns, patients, guards, weekDates, mobile, onAssign }) {
+  const [selPatient, setSelPatient] = useState(null);
+  const [selShift, setSelShift] = useState(null);
+  const [selDate, setSelDate] = useState(null);
+  const [tab, setTab] = useState("suggestions"); // suggestions | insights | patterns
+
+  const hasHistory = assigns.length > 0;
+  const patterns = hasHistory ? learnPatterns(assigns, patients, guards) : null;
+  const insights = hasHistory ? detectInsights(assigns, patients, guards, weekDates) : [];
+
+  // Gaps this week — unassigned slots
+  const gaps = patients.filter(p => p.status === "ACTIVE").flatMap(p =>
+    weekDates.flatMap(d => {
+      const dk = toDateKey(d);
+      const di = dayIdxOfDate(dk);
+      return p.requiredShifts
+        .filter(s => shiftsForDayIdx(di).includes(s))
+        .filter(s => !assigns.find(a => a.patientId === p.id && a.shift === s && a.date === dk))
+        .map(s => ({ patient: p, shift: s, date: dk, day: fmtDate(d) }));
+    })
+  );
+
+  const suggestions = selPatient && selShift && selDate && patterns
+    ? getSuggestions(selPatient.id, selShift, selDate, patterns, guards, assigns, weekDates)
+    : [];
+
+  // Confidence colour
+  const confColor = c => c === "high" ? "#16a34a" : c === "medium" ? "#d97706" : "#64748b";
+  const confBg = c => c === "high" ? "#f0fdf4" : c === "medium" ? "#fffbeb" : "#f8fafc";
+  const confBorder = c => c === "high" ? "#86efac" : c === "medium" ? "#fcd34d" : "#e2e8f0";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+
+      {/* Header stat */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8 }}>
+        {[
+          { l: "Historical shifts", v: assigns.length, bg: "#f0f9ff", c: "#0369a1" },
+          { l: "Open gaps this week", v: gaps.length, bg: gaps.length > 0 ? "#fef2f2" : "#f0fdf4", c: gaps.length > 0 ? "#dc2626" : "#16a34a" },
+          { l: "Guards tracked", v: guards.length, bg: "#f5f3ff", c: "#7e22ce" },
+        ].map(x => (
+          <div key={x.l} style={{ background: x.bg, borderRadius: 10, padding: "10px 12px" }}>
+            <div style={{ fontSize: 9, color: x.c, opacity: .7, marginBottom: 1 }}>{x.l}</div>
+            <div style={{ fontSize: 20, fontWeight: 700, color: x.c }}>{x.v}</div>
+          </div>
+        ))}
+      </div>
+
+      {!hasHistory && (
+        <div style={{ background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 12, padding: "20px", textAlign: "center", color: "#92400e", fontSize: 13 }}>
+          ⚠ Not enough data yet. The AI learns from your assignment history — add some shifts first and come back!
+        </div>
+      )}
+
+      {hasHistory && (
+        <>
+          {/* Tabs */}
+          <div style={{ display: "flex", borderBottom: "0.5px solid #e2e8f0" }}>
+            {[["suggestions", "🎯 Suggestions"], ["insights", "💡 Insights"], ["patterns", "📊 Patterns"]].map(([key, lbl]) => (
+              <div key={key} onClick={() => setTab(key)}
+                style={{
+                  padding: "8px 16px", fontSize: 12, fontWeight: 500, cursor: "pointer",
+                  color: tab === key ? "#3b82f6" : "#64748b",
+                  borderBottom: tab === key ? "2px solid #3b82f6" : "2px solid transparent",
+                  marginBottom: -1, userSelect: "none"
+                }}>
+                {lbl}
+              </div>
+            ))}
+          </div>
+
+          {/* ── TAB: SUGGESTIONS ── */}
+          {tab === "suggestions" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ fontSize: 12, color: "#64748b" }}>
+                Select an open shift below — the AI will suggest the best guard based on historical patterns.
+              </div>
+
+              {/* Gap list */}
+              {gaps.length === 0 ? (
+                <div style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 10, padding: "14px", textAlign: "center", fontSize: 13, color: "#14532d" }}>
+                  ✅ All shifts covered this week — no open slots!
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {gaps.map((g, i) => {
+                    const sh = SHIFTS[g.shift];
+                    const sel = selPatient?.id === g.patient.id && selShift === g.shift && selDate === g.date;
+                    return (
+                      <div key={i} onClick={() => { setSelPatient(g.patient); setSelShift(g.shift); setSelDate(g.date); }}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 9,
+                          border: `1px solid ${sel ? "#3b82f6" : "#e2e8f0"}`, background: sel ? "#eff6ff" : "#fff", cursor: "pointer"
+                        }}>
+                        <span style={{ ...pill(sh?.bg, sh?.color), fontSize: 10 }}>{sh?.label}</span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 12, fontWeight: 500, color: "#0f172a" }}>{g.patient.name}</div>
+                          <div style={{ fontSize: 10, color: "#64748b" }}>{g.day} · {sh?.time}</div>
+                        </div>
+                        <span style={{ fontSize: 10, color: sel ? "#3b82f6" : "#94a3b8", flexShrink: 0 }}>{sel ? "▾ Showing suggestions" : "tap for suggestions"}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Suggestions for selected slot */}
+              {selPatient && selShift && selDate && (
+                <div style={{ background: "#f8fafc", borderRadius: 12, padding: "14px", border: "1px solid #e2e8f0" }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", marginBottom: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    🧠 AI Suggestions — {selPatient.name} · {SHIFTS[selShift]?.label} · {selDate}
+                  </div>
+                  {suggestions.length === 0 ? (
+                    <div style={{ fontSize: 12, color: "#94a3b8", textAlign: "center", padding: "12px 0" }}>
+                      No available guards match this slot.
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {suggestions.map((s, i) => (
+                        <div key={i} style={{
+                          display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 9,
+                          background: confBg(s.confidence), border: `1px solid ${confBorder(s.confidence)}`
+                        }}>
+                          {/* Rank */}
+                          <div style={{
+                            width: 24, height: 24, borderRadius: "50%", background: i === 0 ? "#3b82f6" : i === 1 ? "#64748b" : "#e2e8f0",
+                            color: i < 2 ? "#fff" : "#64748b", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0
+                          }}>
+                            {i + 1}
+                          </div>
+                          {/* Guard info */}
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                              <span style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>{s.name}</span>
+                              <span style={{ ...pill(confBg(s.confidence), confColor(s.confidence)), fontSize: 9, border: `1px solid ${confBorder(s.confidence)}` }}>
+                                {s.confidence === "high" ? "✓ Best match" : s.confidence === "medium" ? "Good match" : "Possible"}
+                              </span>
+                              {s.overLimit && <span style={{ fontSize: 9, color: "#dc2626" }}>⚠ over limit</span>}
+                            </div>
+                            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                              {s.affinityCount > 0 && <span style={{ fontSize: 9, color: "#64748b" }}>🔁 Assigned here {s.affinityCount}× before</span>}
+                              <span style={{ fontSize: 9, color: "#64748b" }}>⏱ {s.weekHrs}h this week → {s.hoursAfter}h / {s.limit}h</span>
+                              {s.recentHours > 0 && <span style={{ fontSize: 9, color: "#64748b" }}>📅 {s.recentHours}h last 4 weeks</span>}
+                            </div>
+                          </div>
+                          {/* Assign button */}
+                          <button onClick={() => { onAssign(selPatient.id, selShift, selDate); }}
+                            style={{ ...btnS(true), fontSize: 11, padding: "5px 12px", flexShrink: 0, background: i === 0 ? "#3b82f6" : "#64748b" }}>
+                            Assign
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ── TAB: INSIGHTS ── */}
+          {tab === "insights" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ fontSize: 12, color: "#64748b" }}>Patterns and anomalies detected from your scheduling history.</div>
+              {insights.length === 0 ? (
+                <div style={{ padding: "20px", textAlign: "center", color: "#94a3b8", fontSize: 13 }}>No insights yet — add more schedule data.</div>
+              ) : insights.map((ins, i) => {
+                const bg = ins.type === "warning" ? "#fffbeb" : ins.type === "success" ? "#f0fdf4" : "#f0f9ff";
+                const border = ins.type === "warning" ? "#fcd34d" : ins.type === "success" ? "#86efac" : "#bae6fd";
+                const color = ins.type === "warning" ? "#92400e" : ins.type === "success" ? "#14532d" : "#0369a1";
+                return (
+                  <div key={i} style={{ padding: "12px 14px", borderRadius: 10, background: bg, border: `1px solid ${border}`, display: "flex", gap: 10, alignItems: "flex-start" }}>
+                    <span style={{ fontSize: 18, flexShrink: 0 }}>{ins.icon}</span>
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color }}>{ins.title}</div>
+                      <div style={{ fontSize: 11, color, opacity: .8, marginTop: 2 }}>{ins.body}</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ── TAB: PATTERNS ── */}
+          {tab === "patterns" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div style={{ fontSize: 12, color: "#64748b" }}>What the model has learned from your {assigns.length} historical assignments.</div>
+
+              {/* Top guard per patient+shift */}
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Most frequent guard per slot</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {patients.filter(p => p.status === "ACTIVE").flatMap(p =>
+                    p.requiredShifts.map(shift => {
+                      const slotCounts = patterns.slotBest[`${p.id}-${shift}`] || {};
+                      const entries = Object.entries(slotCounts).sort((a, b) => b[1] - a[1]);
+                      if (!entries.length) return null;
+                      const [top, count] = entries[0];
+                      const sh = SHIFTS[shift];
+                      return (
+                        <div key={`${p.id}-${shift}`} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 11 }}>
+                          <span style={{ ...pill(sh?.bg, sh?.color), fontSize: 9 }}>{sh?.label}</span>
+                          <span style={{ color: "#374151", flex: 1 }}>{p.name}</span>
+                          <span style={{ color: "#0f172a", fontWeight: 600 }}>{top.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ")}</span>
+                          <span style={{ color: "#94a3b8", fontSize: 9 }}>{count}×</span>
+                        </div>
+                      );
+                    }).filter(Boolean)
+                  )}
+                </div>
+              </div>
+
+              {/* Guard shift preferences */}
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#374151", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 8 }}>Guard shift preferences (by frequency)</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                  {guards.filter(g => {
+                    return Object.keys(patterns.shiftPref).some(k => k.startsWith(g.name.toLowerCase().trim() + "-"));
+                  }).map((g, i) => {
+                    const n = g.name.toLowerCase().trim();
+                    const prefs = Object.entries(patterns.shiftPref)
+                      .filter(([k]) => k.startsWith(n + "-"))
+                      .map(([k, v]) => ({ shift: k.replace(n + "-", ""), count: v }))
+                      .sort((a, b) => b.count - a.count);
+                    if (!prefs.length) return null;
+                    const [bg, col] = avCol(i);
+                    return (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0" }}>
+                        <div style={{ width: 28, height: 28, borderRadius: "50%", background: bg, color: col, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 700, flexShrink: 0 }}>{ini(g.name)}</div>
+                        <span style={{ fontSize: 11, fontWeight: 500, color: "#0f172a", minWidth: mobile ? 80 : 130, flexShrink: 0 }}>{g.name}</span>
+                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap", flex: 1 }}>
+                          {prefs.slice(0, 3).map(p => (
+                            <div key={p.shift} style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                              <span style={{ ...pill(SHIFTS[p.shift]?.bg, SHIFTS[p.shift]?.color), fontSize: 9 }}>{SHIFTS[p.shift]?.label || p.shift}</span>
+                              <span style={{ fontSize: 9, color: "#94a3b8" }}>{p.count}×</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  }).filter(Boolean)}
+                </div>
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }
